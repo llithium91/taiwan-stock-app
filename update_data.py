@@ -106,37 +106,96 @@ def fetch_twse_tpex_daily(date_str):
                         except ValueError:
                             continue
                 break
-        except Exception as e:
-            if attempt == 3:
-                print(f"\n⚠️ 抓取 TPEx 失敗 ({date_str}): {e}")
-            time.sleep(2.0)
+        except Exception:
+            time.sleep(1.5)
 
     return pd.DataFrame(records)
 
 
+def get_db_latest_date(conn):
+    """檢查資料庫中現有的最新日期"""
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = [row[0] for row in cursor.fetchall()]
+
+        if not tables:
+            return None
+
+        # 抽查前 10 檔表格取得最大日期
+        latest_dates = []
+        for t in tables[:10]:
+            try:
+                df = pd.read_sql_query(
+                    f"SELECT date FROM {t} ORDER BY date DESC LIMIT 1", conn
+                )
+                if not df.empty:
+                    latest_dates.append(df["date"].iloc[0])
+            except Exception:
+                continue
+
+        return max(latest_dates) if latest_dates else None
+    except Exception:
+        return None
+
+
 def update_database(progress_callback=None):
-    """更新全市場資料庫 (具備自動回溯補齊功能)"""
+    """智慧增量更新資料庫 (資料庫有舊資料時僅補抓欠缺日期，極速完成)"""
     conn = sqlite3.connect(DB_PATH)
 
+    db_latest = get_db_latest_date(conn)
     today = datetime.now()
+
     trading_dates = []
 
-    for i in range(110):
-        d = today - timedelta(days=i)
-        if d.weekday() < 5:
-            trading_dates.append(d.strftime("%Y-%m-%d"))
+    if db_latest is None:
+        # 【全量初始化】資料庫空白，抓過去 80 個交易日 (約 110 日曆天)
+        lookback_days = 110
+        if progress_callback:
+            progress_callback(
+                0, 100, "🔍 資料庫初次建立，將備份歷史 80 個交易日數據..."
+            )
+    else:
+        # 【智慧增量更新】只補抓最新日期之後的缺漏交易日
+        latest_dt = datetime.strptime(db_latest, "%Y-%m-%d")
+        delta_days = (today - latest_dt).days
 
-    trading_dates = trading_dates[::-1]
+        if delta_days <= 0:
+            if progress_callback:
+                progress_callback(
+                    1, 1, f"✅ 資料庫已是最新狀態 ({db_latest})，無需更新！"
+                )
+            conn.close()
+            return
+
+        lookback_days = delta_days
+
+    # 產生需要補抓的日期清單
+    for i in range(lookback_days, 0, -1):
+        d = today - timedelta(days=i)
+        if d.weekday() < 5:  # 排除週末
+            date_str = d.strftime("%Y-%m-%d")
+            if db_latest is None or date_str > db_latest:
+                trading_dates.append(date_str)
+
     total_days = len(trading_dates)
+
+    if total_days == 0:
+        if progress_callback:
+            progress_callback(1, 1, "✅ 目前已是最新交易日數據！")
+        conn.close()
+        return
 
     if progress_callback:
         progress_callback(
-            0, total_days, f"🚀 連線證交所/櫃買中心 (共 {total_days} 個交易日)..."
+            0,
+            total_days,
+            f"🚀 啟動智慧增量更新，僅需抓取欠缺的 {total_days} 個交易日...",
         )
 
     all_dfs = []
     for idx, date_str in enumerate(trading_dates, 1):
-        time.sleep(0.4)
+        time.sleep(0.3)
         df_day = fetch_twse_tpex_daily(date_str)
 
         if not df_day.empty:
@@ -151,7 +210,7 @@ def update_database(progress_callback=None):
     if all_dfs:
         if progress_callback:
             progress_callback(
-                total_days, total_days, "💾 正在整理數據並寫入 SQLite 資料庫..."
+                total_days, total_days, "💾 正在將新數據追加 (Append) 至 SQLite..."
             )
 
         full_df = pd.concat(all_dfs, ignore_index=True)
@@ -160,22 +219,46 @@ def update_database(progress_callback=None):
 
         for idx, (s_id, group_df) in enumerate(grouped, 1):
             table_name = f"stock_{s_id}"
-            group_df.to_sql(table_name, conn, if_exists="replace", index=False)
+
+            if db_latest is None:
+                # 第一次全量直接覆蓋
+                group_df.to_sql(
+                    table_name, conn, if_exists="replace", index=False
+                )
+            else:
+                # 增量更新：先讀取既有資料，結合新數據並去重後寫回
+                try:
+                    existing_df = pd.read_sql_query(
+                        f"SELECT * FROM {table_name}", conn
+                    )
+                    combined_df = pd.concat(
+                        [existing_df, group_df], ignore_index=True
+                    )
+                    combined_df = combined_df.drop_duplicates(
+                        subset=["date"]
+                    ).sort_values("date")
+                    combined_df.to_sql(
+                        table_name, conn, if_exists="replace", index=False
+                    )
+                except Exception:
+                    group_df.to_sql(
+                        table_name, conn, if_exists="replace", index=False
+                    )
 
             if progress_callback and (
-                idx % 200 == 0 or idx == total_stocks
+                idx % 300 == 0 or idx == total_stocks
             ):
                 progress_callback(
                     total_days,
                     total_days,
-                    f"⚙️ 寫入資料庫進度: {idx}/{total_stocks} 檔股票",
+                    f"⚙️ 增量寫入進度: {idx}/{total_stocks} 檔股票",
                 )
 
         if progress_callback:
             progress_callback(
                 total_days,
                 total_days,
-                f"✅ 更新完成！共成功備份 {total_stocks} 檔台股個股數據。",
+                f"✅ 更新完成！成功補充 {total_days} 個交易日數據。",
             )
 
     conn.close()
