@@ -1,72 +1,76 @@
 import os
-import sqlite3
 import time
-import analyze  # 多策略分析模組
+import analyze
 import pandas as pd
-import plot_chart  # 繪圖模組
+import plot_chart
 import streamlit as st
 import update_data
+from sqlalchemy import create_engine, text
 
 st.set_page_config(page_title="台股量化選股與 K 線分析系統", layout="wide")
 
 st.title("📈 台股量化選股與互動 K 線控制台")
 
-# ==================== 1. 側邊欄：操作與資料庫狀態監控 ====================
 st.sidebar.header("🕹️ 操作控制台")
 
-DB_PATH = "taiwan_stock_daily.db"
+DB_URI = os.getenv("SUPABASE_URL", "sqlite:///taiwan_stock_daily.db")
+
+
+def get_db_engine():
+    if DB_URI.startswith("sqlite"):
+        return create_engine(DB_URI)
+    return create_engine(DB_URI, pool_pre_ping=True)
 
 
 def get_db_status():
-    """查詢 SQLite 資料庫狀態：總股票數與真正的最新交易日 (取多檔最大值)"""
-    if not os.path.exists(DB_PATH):
-        return None
-
+    engine = get_db_engine()
     try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-        tables = [row[0] for row in cursor.fetchall()]
-
-        if not tables:
-            conn.close()
-            return None
-
-        stock_count = len(tables)
-
-        latest_dates = []
-        for table in tables[:15]:
-            try:
-                date_df = pd.read_sql_query(
-                    f"SELECT date FROM {table} ORDER BY date DESC LIMIT 1", conn
+        with engine.connect() as conn:
+            if DB_URI.startswith("sqlite"):
+                res = conn.execute(
+                    text("SELECT name FROM sqlite_master WHERE type='table';")
                 )
-                if not date_df.empty:
-                    latest_dates.append(date_df["date"].iloc[0])
-            except Exception:
-                continue
+                tables = [row[0] for row in res.fetchall()]
+                if not tables:
+                    return None
+                stock_count = len(tables)
+                latest_date_df = pd.read_sql_query(
+                    f"SELECT date FROM {tables[0]} ORDER BY date DESC LIMIT 1",
+                    conn,
+                )
+                latest_date = (
+                    latest_date_df["date"].iloc[0]
+                    if not latest_date_df.empty
+                    else "未知"
+                )
+            else:
+                stock_count_df = pd.read_sql_query(
+                    "SELECT COUNT(DISTINCT stock_id) as count FROM taiwan_stocks_daily",
+                    conn,
+                )
+                latest_date_df = pd.read_sql_query(
+                    "SELECT MAX(date) as max_date FROM taiwan_stocks_daily", conn
+                )
+                stock_count = stock_count_df["count"].iloc[0]
+                latest_date = latest_date_df["max_date"].iloc[0]
 
-        conn.close()
-
-        real_latest_date = max(latest_dates) if latest_dates else "未知"
-
-        return {"stock_count": stock_count, "latest_date": real_latest_date}
+        engine.dispose()
+        return {"stock_count": stock_count, "latest_date": latest_date}
     except Exception:
+        engine.dispose()
         return None
 
 
-# 顯示資料庫狀態卡片
 st.sidebar.subheader("💾 資料庫即時狀態")
 db_info = get_db_status()
 
-if db_info:
+if db_info and db_info["stock_count"] > 0:
     st.sidebar.success(f"📅 **最新資料日期**：{db_info['latest_date']}")
     st.sidebar.info(f"📊 **已備份股票數**：{db_info['stock_count']} 檔")
 else:
-    st.sidebar.warning("⚠️ **目前無資料**：請點擊下方按鈕更新資料庫。")
+    st.sidebar.warning("⚠️ **雲端無資料**：點擊下方按鈕初始化 Supabase。")
 
-# 手動更新與即時進度呈現
-if st.sidebar.button("📥 下載/更新最新收盤數據"):
+if st.sidebar.button("📥 手動更新/同步最新收盤數據"):
     progress_bar = st.sidebar.progress(0)
     status_text = st.sidebar.empty()
 
@@ -77,7 +81,7 @@ if st.sidebar.button("📥 下載/更新最新收盤數據"):
 
     try:
         update_data.update_database(progress_callback=update_ui_progress)
-        st.sidebar.success("✅ 資料庫更新完成！")
+        st.sidebar.success("✅ Supabase 資料庫更新完成！")
         time.sleep(1)
         st.rerun()
     except Exception as e:
@@ -85,7 +89,6 @@ if st.sidebar.button("📥 下載/更新最新收盤數據"):
 
 st.sidebar.divider()
 
-# ==================== 2. 策略選擇與倍數設定區 (Form 防爆機制) ====================
 with st.sidebar.form("strategy_form"):
     st.subheader("🎯 策略與倍數參數設定")
 
@@ -124,13 +127,10 @@ with st.sidebar.form("strategy_form"):
 
     submitted = st.form_submit_button("🚀 套用設定並執行分析")
 
-# ==================== 3. 主畫面執行與數據呈現 ====================
 if submitted or st.session_state.get("run_analysis", False):
     st.session_state["run_analysis"] = True
 
-    if not os.path.exists(DB_PATH):
-        st.error("找不到資料庫，請先從左側執行『下載/更新最新收盤數據』！")
-    elif not selected_keys:
+    if not selected_keys:
         st.warning("請至少勾選一種選股策略！")
     else:
         with st.spinner("正在進行全台股多重策略比對中..."):
@@ -141,12 +141,11 @@ if submitted or st.session_state.get("run_analysis", False):
             )
             st.session_state["result_df"] = result_df
 
-# 展示分析結果與 K 線圖
 if "result_df" in st.session_state and not st.session_state["result_df"].empty:
     result_df = st.session_state["result_df"]
 
     st.success(
-        f"🎯 分析完成！共找到 {len(result_df)} 档同時符合條件的標的："
+        f"🎯 分析完成！共找到 {len(result_df)} 檔同時符合條件的標的："
     )
 
     display_cols = [
@@ -184,11 +183,17 @@ if "result_df" in st.session_state and not st.session_state["result_df"].empty:
         target_id = selected_stock_str.split(" ")[0]
         target_name = selected_stock_str.split(" ")[1]
 
-        conn = sqlite3.connect(DB_PATH)
-        stock_kdf = pd.read_sql_query(
-            f"SELECT * FROM stock_{target_id}", conn
-        )
-        conn.close()
+        engine = get_db_engine()
+        if DB_URI.startswith("sqlite"):
+            stock_kdf = pd.read_sql_query(
+                f"SELECT * FROM stock_{target_id} ORDER BY date ASC", engine
+            )
+        else:
+            stock_kdf = pd.read_sql_query(
+                f"SELECT * FROM taiwan_stocks_daily WHERE stock_id='{target_id}' ORDER BY date ASC",
+                engine,
+            )
+        engine.dispose()
 
         if not stock_kdf.empty:
             stock_kdf["MA5"] = stock_kdf["close"].rolling(5).mean()
