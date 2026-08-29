@@ -1,5 +1,6 @@
-streamlit>=1.30.0
-supabase>=2.0.0
-requests>=2.31.0
-gTTS>=2.4.0
-google-genai
+streamlit
+pandas
+plotly
+requests
+sqlalchemy
+psycopg2-binary
