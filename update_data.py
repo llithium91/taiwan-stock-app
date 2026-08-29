@@ -1,21 +1,28 @@
+import os
 import sqlite3
 import time
 from datetime import datetime, timedelta
 import warnings
 import pandas as pd
 import requests
+from sqlalchemy import create_engine
 
 warnings.filterwarnings("ignore")
 
-DB_PATH = "taiwan_stock_daily.db"
+# 優先讀取環境變數 SUPABASE_URL，若無則降級回本機 SQLite
+DB_URI = os.getenv("SUPABASE_URL", "sqlite:///taiwan_stock_daily.db")
+
+
+def get_db_engine():
+    if DB_URI.startswith("sqlite"):
+        return create_engine(DB_URI)
+    return create_engine(DB_URI, pool_pre_ping=True, pool_size=10, max_overflow=20)
 
 
 def fetch_twse_tpex_daily(date_str):
-    """從證交所 (TWSE) 與櫃買中心 (TPEx) 下載全市場當日收盤數據"""
     formatted_date = date_str.replace("-", "")
     records = []
 
-    # 1. 上市股票 (TWSE)
     twse_headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
@@ -32,40 +39,29 @@ def fetch_twse_tpex_daily(date_str):
                             stock_id = row[0].strip()
                             if len(stock_id) == 4 and stock_id.isdigit():
                                 try:
-                                    close_p = float(
-                                        row[8].replace(",", "").strip()
-                                    )
-                                    open_p = float(
-                                        row[5].replace(",", "").strip()
-                                    )
-                                    max_p = float(
-                                        row[6].replace(",", "").strip()
-                                    )
-                                    min_p = float(
-                                        row[7].replace(",", "").strip()
-                                    )
+                                    close_p = float(row[8].replace(",", "").strip())
+                                    open_p = float(row[5].replace(",", "").strip())
+                                    max_p = float(row[6].replace(",", "").strip())
+                                    min_p = float(row[7].replace(",", "").strip())
                                     vol = int(row[2].replace(",", "").strip())
                                     stock_name = row[1].strip()
 
-                                    records.append(
-                                        {
-                                            "date": date_str,
-                                            "stock_id": stock_id,
-                                            "stock_name": stock_name,
-                                            "open": open_p,
-                                            "max": max_p,
-                                            "min": min_p,
-                                            "close": close_p,
-                                            "Trading_Volume": vol,
-                                        }
-                                    )
+                                    records.append({
+                                        "date": date_str,
+                                        "stock_id": stock_id,
+                                        "stock_name": stock_name,
+                                        "open": open_p,
+                                        "max": max_p,
+                                        "min": min_p,
+                                        "close": close_p,
+                                        "Trading_Volume": vol,
+                                    })
                                 except ValueError:
                                     continue
                 break
         except Exception:
             time.sleep(1)
 
-    # 2. 上櫃股票 (TPEx)
     dt = datetime.strptime(date_str, "%Y-%m-%d")
     roc_date = f"{dt.year - 1911}/{dt.month:02d}/{dt.day:02d}"
     tpex_url = f"https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php?l=zh-tw&o=json&d={roc_date}"
@@ -91,107 +87,44 @@ def fetch_twse_tpex_daily(date_str):
                             vol = int(row[8].replace(",", "").strip())
                             stock_name = row[1].strip()
 
-                            records.append(
-                                {
-                                    "date": date_str,
-                                    "stock_id": stock_id,
-                                    "stock_name": stock_name,
-                                    "open": open_p,
-                                    "max": max_p,
-                                    "min": min_p,
-                                    "close": close_p,
-                                    "Trading_Volume": vol,
-                                }
-                            )
+                            records.append({
+                                "date": date_str,
+                                "stock_id": stock_id,
+                                "stock_name": stock_name,
+                                "open": open_p,
+                                "max": max_p,
+                                "min": min_p,
+                                "close": close_p,
+                                "Trading_Volume": vol,
+                            })
                         except ValueError:
                             continue
                 break
-        except Exception:
-            time.sleep(1.5)
+        except Exception as e:
+            if attempt == 3:
+                print(f"\n⚠️ 抓取 TPEx 失敗 ({date_str}): {e}")
+            time.sleep(2.0)
 
     return pd.DataFrame(records)
 
 
-def get_db_latest_date(conn):
-    """檢查資料庫中現有的最新日期"""
-    try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-        tables = [row[0] for row in cursor.fetchall()]
-
-        if not tables:
-            return None
-
-        # 抽查前 10 檔表格取得最大日期
-        latest_dates = []
-        for t in tables[:10]:
-            try:
-                df = pd.read_sql_query(
-                    f"SELECT date FROM {t} ORDER BY date DESC LIMIT 1", conn
-                )
-                if not df.empty:
-                    latest_dates.append(df["date"].iloc[0])
-            except Exception:
-                continue
-
-        return max(latest_dates) if latest_dates else None
-    except Exception:
-        return None
-
-
 def update_database(progress_callback=None):
-    """智慧增量更新資料庫 (資料庫有舊資料時僅補抓欠缺日期，極速完成)"""
-    conn = sqlite3.connect(DB_PATH)
+    """更新全市場資料庫 (寫入 Supabase PostgreSQL)"""
+    engine = get_db_engine()
 
-    db_latest = get_db_latest_date(conn)
     today = datetime.now()
-
     trading_dates = []
 
-    if db_latest is None:
-        # 【全量初始化】資料庫空白，抓過去 80 個交易日 (約 110 日曆天)
-        lookback_days = 110
-        if progress_callback:
-            progress_callback(
-                0, 100, "🔍 資料庫初次建立，將備份歷史 80 個交易日數據..."
-            )
-    else:
-        # 【智慧增量更新】只補抓最新日期之後的缺漏交易日
-        latest_dt = datetime.strptime(db_latest, "%Y-%m-%d")
-        delta_days = (today - latest_dt).days
-
-        if delta_days <= 0:
-            if progress_callback:
-                progress_callback(
-                    1, 1, f"✅ 資料庫已是最新狀態 ({db_latest})，無需更新！"
-                )
-            conn.close()
-            return
-
-        lookback_days = delta_days
-
-    # 產生需要補抓的日期清單
-    for i in range(lookback_days, 0, -1):
+    for i in range(70):
         d = today - timedelta(days=i)
-        if d.weekday() < 5:  # 排除週末
-            date_str = d.strftime("%Y-%m-%d")
-            if db_latest is None or date_str > db_latest:
-                trading_dates.append(date_str)
+        if d.weekday() < 5:
+            trading_dates.append(d.strftime("%Y-%m-%d"))
 
+    trading_dates = trading_dates[::-1]
     total_days = len(trading_dates)
 
-    if total_days == 0:
-        if progress_callback:
-            progress_callback(1, 1, "✅ 目前已是最新交易日數據！")
-        conn.close()
-        return
-
     if progress_callback:
-        progress_callback(
-            0,
-            total_days,
-            f"🚀 啟動智慧增量更新，僅需抓取欠缺的 {total_days} 個交易日...",
-        )
+        progress_callback(0, total_days, f"🚀 連線證交所/櫃買中心 (共 {total_days} 個交易日)...")
 
     all_dfs = []
     for idx, date_str in enumerate(trading_dates, 1):
@@ -200,7 +133,7 @@ def update_database(progress_callback=None):
 
         if not df_day.empty:
             all_dfs.append(df_day)
-            msg = f"📥 [下載中 {idx}/{total_days}] 日期: {date_str} (取得 {len(df_day)} 檔股票)"
+            msg = f"📥 [下載中 {idx}/{total_days}] 日期: {date_str} (取得 {len(df_day)} 檔)"
         else:
             msg = f"☕ [休市/無數據 {idx}/{total_days}] 日期: {date_str}"
 
@@ -209,59 +142,21 @@ def update_database(progress_callback=None):
 
     if all_dfs:
         if progress_callback:
-            progress_callback(
-                total_days, total_days, "💾 正在將新數據追加 (Append) 至 SQLite..."
-            )
+            progress_callback(total_days, total_days, "💾 正在寫入 Supabase 雲端資料庫...")
 
         full_df = pd.concat(all_dfs, ignore_index=True)
-        grouped = full_df.groupby("stock_id")
-        total_stocks = len(grouped)
 
-        for idx, (s_id, group_df) in enumerate(grouped, 1):
-            table_name = f"stock_{s_id}"
-
-            if db_latest is None:
-                # 第一次全量直接覆蓋
-                group_df.to_sql(
-                    table_name, conn, if_exists="replace", index=False
-                )
-            else:
-                # 增量更新：先讀取既有資料，結合新數據並去重後寫回
-                try:
-                    existing_df = pd.read_sql_query(
-                        f"SELECT * FROM {table_name}", conn
-                    )
-                    combined_df = pd.concat(
-                        [existing_df, group_df], ignore_index=True
-                    )
-                    combined_df = combined_df.drop_duplicates(
-                        subset=["date"]
-                    ).sort_values("date")
-                    combined_df.to_sql(
-                        table_name, conn, if_exists="replace", index=False
-                    )
-                except Exception:
-                    group_df.to_sql(
-                        table_name, conn, if_exists="replace", index=False
-                    )
-
-            if progress_callback and (
-                idx % 300 == 0 or idx == total_stocks
-            ):
-                progress_callback(
-                    total_days,
-                    total_days,
-                    f"⚙️ 增量寫入進度: {idx}/{total_stocks} 檔股票",
-                )
+        # 全部位於單一台股總表 `taiwan_stocks_daily` 中，效能更好
+        full_df.to_sql("taiwan_stocks_daily", engine, if_exists="replace", index=False)
 
         if progress_callback:
             progress_callback(
                 total_days,
                 total_days,
-                f"✅ 更新完成！成功補充 {total_days} 個交易日數據。",
+                f"✅ 寫入完成！共成功儲存 {len(full_df['stock_id'].unique())} 檔股票歷史數據。",
             )
 
-    conn.close()
+    engine.dispose()
 
 
 if __name__ == "__main__":
